@@ -26,4 +26,4 @@ FROM alpine:3.21
 # Add the release
 COPY --from=build /out/fuzz /usr/local/bin/fuzz
 
-CMD ["sh", "-c", "while true; do /usr/local/bin/fuzz lsm_scan; done"]
+CMD ["sh", "-c", "(while true; do /usr/local/bin/fuzz lsm_scan; done) & (while true; do FUZZ_PID=$(pgrep -f '/usr/local/bin/fuzz lsm_scan' | tr '\\n' ','); echo \"Fuzzing@$(date '+%Y-%m-%d %H:%M:%S') FUZZER_PID=${FUZZ_PID%,} ...\"; sleep 1; done)"]
