@@ -1,0 +1,157 @@
+# KubeCon Talk Notes
+
+- Presentation intro
+- Company intro
+- Speaker intro
+- Idea and Motivation
+  - Law of complements: "layers of the stack attempting to become monopolies while turning other layers into perfectly-competitive markets which are commoditized"
+  - E.g. IBM wants Linux to succeed because it's the complement to it's hardware, car manufacturers want roads to be free and commoditized since roads are the complement to their product etc.
+  - Levels of lock-in that are effectively trade restrictions (optimally, users of cloud software want abstract "compute" resources - but cloud providers do everything they can to make their compute not just "compute", but AWS Compute, EC2 compute etc.)
+  - Comparative advantage once these restrictions are removed (why it's essentially guaranteed to be better for the customer to have truly fungible compute): A truly free market for the cloud
+  - In such a free market, spot instances could become an option since it's risk and downtime-free to switch providers
+  - As a cloud user or operator, the cloud itself can become your commoditized complement and you regain digital sovereignty
+  - You could freely move between them at any point when costs change
+  - The problem with implementing this until now: VMs can not be run on top of most cloud providers without paying a lot of money for bare metal (which comes with a lot of drawbacks like long provisioning time), so applications can't be defined in a cloud-agnostic way that gives users as much control as the cloud provider itself does (leaky abstractions) since they don't support VMs on VMs (containers are evidently not enough to protect clouds from their users or to really make users free from their clouds!)
+  - Applications also can't be moved between cloud providers, and even if the code is portable enough, it will result in downtime
+  - What if that were possible though? What if you could treat any virtual cloud server like it were a bare metal server that you could start VMs on & migrate them around?
+  - Applications can move with you as you move, or closer to where most of your users are at the moment
+  - Instead of you having to move data closer to your users, you can move your app closer to your users - e.g. move you processing into the secure data center, and only transfer out the result
+  - If you decide to switch cloud providers, you can just move your VMs over to it - no downtime, no need to worry about rewriting your terraform, writing bare-metal code or fighting all of the obscure quirks with the images of distros that they ship on their custom Linux distro images (different users, files in different places, networking configuration - the abstractions don't match!)
+  - You can move an app off-site, update server hardware, and move it back
+  - If you have an issue with an app, you can always have a continous mirror of your application ready to spin up
+  - You could integrate with secure enclave/confidential computing technologies to move your apps to untrusted compute platforms or into applications that have strict security requirements (e.g. banks)
+  - Moving applications that are running on a remote machine to the local system for debugging (e.g. if a CI/CD job isn't working like expected, we can just move it to the local system)
+  - Scaling applications to public cloud if capacity isn't available at the moment on-prem, but being able to move them back to on-prem if needed
+  - Renting out unused server capacity on-prem to other cloud users (benchmarking, CI/CD etc.)
+  - Running everything on much, much cheaper (-90%) spot instances instead of on-demand instances
+- KVM, PVM and their relationship
+  - KVM is a low-level Linux component that provides an vendor-independent interface to (usually hardware-implemented) vendor-specific virtualization extensions to separate the guest VMs from each other
+  - Hypervisors such as QEMU, Cloud Hypervisor, VMWare (as of very recently) and many others use KVM to implement CPU virtualization, while they implement devices in userspace (e.g. with `virtio`)
+  - KVM can be implemented in many ways however, not just with hardware instructions
+  - Typical vendor implementations are (for Intel) the `kvm_intel` module (which uses the VT-d hardware feature of Intel CPUs) and on AMD the `kvm_amd` (which provides an interface to the AMD-V hardware features of AMD CPUs)
+  - When a CPU is being virtualized by a cloud provider, that hardware support (VT-d/AMD-V) is typically disabled by the cloud provider (which is the case on EC2/GCP/Azure by default)
+  - Even if a cloud provider supports it (e.g. GCP), since the virtualization instructions themselves need to be virtualized, everything becomes very slow and there are lots of latency spikes and scheduling issues (see latency spike graph from PVM paper)
+  - If there is no hardware support (which is the case for almost all cases unless you use bare-metal machines), the only option for running virtual machines as fully emulating the guest CPU (e.g. with QEMU), which is very slow
+  - This effectively blocks the use of virtual machines in cloud providers, and without virtual machines it is impossible to create a unit of compute that is equivalent to the unit that the cloud provider sells (virtual machines)
+  - To work around this, PVM is a very new and experimental vendor implementation that can support fully accelerated virtual machines without requiring these hardware features
+  - This means that with PVM, you can run virtual machines instead of cloud providers without the cloud provider having to consent to this
+  - PVM implements almost all of KVM, so existing hypervisors (e.g. QEMU) work out of the box with almost no changes required
+  - Since it's KVM, you can run a fully custom kernel in the guest on public cloud providers, and this includes adding support for running custom kernel modules, for snapshot/restore support
+  - Even CPU features can be disabled or enabled piece by piece
+  - VM snapshots, images and thus the unit of compute itself becomes portable, and can truly run across multiple cloud providers
+  - PVM is implemented as a kernel module and also requires some non-mainlined kernel patches for now
+  - Developed by Alibaba & Ant Group and first RFC patches submitted to the LKML in early 2024
+  - Primarly designed to run secure containers through platforms like Kata Containers, but since Kata Containers is based on KVM it also enables QEMU, Cloud Hypervisor and other hypervisors to run "traditional" VMs
+  - (Add section here on how PVM is implemented exactly - take notes while reading the paper)
+- Firecracker, CPU templates & `MAP_SHARED`/msync for continous snapshotting
+  - Firecracker is a popular hypervisor
+  - Developed by Amazon
+  - Creates "microVMs" that can start and stop very quickly and only implement the bare minimum feature/device set for those VMs to start
+  - Is written in Rust and in general quite hackable as a result (unlike large codebases like e.g. QEMU)
+  - Has support for CPU templates, which allows hiding different CPU features from the guest
+  - This is very useful for creating a cluster of nodes that has different CPUs on the host, but where the guests should all look and behave the same
+  - For example, by using the `T2CL` templates we can ensure that all Intel CPUs behave like Intel Cascade Lake, and by using the `T2A` template we can make all AMD CPUs behave like AMD Milan CPUs
+  - Firecracker also supports full snapshot/restore semantics
+  - We can stop time inside the virtual machine, dump the memory and CPU registers to a file, and resume time
+  - Using the memory file and CPU registers, we can then restore the exact state the VM was in at another point in time, and from the perspective of the guest nothing happened in the meantime
+  - When combined with CPU templates, this snapshot functionality can be used to suspend a VM on one host, take a snapshot, and restore it on another host even if that host has a slightly different CPU (since the CPU template can restrict the CPU feature set to the smallest common denominator)
+  - We have a small patch to Firecracker that allows using PVM with it's snapshot/restore function by including the PVM MSRs
+  - When combining CPU templates, snapshot/restore functionality _and_ PVM together, it becomes possible to move VMs between two different cloud providers, without bare-metal or nested virtualization, and without losing any state
+  - Having to dump the entire VM memory and CPU registers into a file each time is however quite expensive
+  - Dumping a 16 GB VM's memory can take multiple seconds
+  - After dumping the memory, it also needs to be copied to the destination host
+  - This becomes a real problem if the VM needs to be evacuated from a spot instance that is being shut down, where the notification is only between 120s and 30s before the VM and all of it's data is lost
+  - To work around this we patch Firecracker to allow it to continously snapshot the VM's memory, meaning that we don't need to write to a new file each time but rather continously get the changes
+  - By default, Firecracker `mmap`s the underlying memory region, usually with `MAP_PRIVATE` (so that any writes go into anonymous, ephemeral memory regions), and when a snapshot is made those anonymous regions are read, merged with the regions from the original file/snapshot, and written to a resulting file
+  - We instead `MAP_PRIVATE` the file, which means that the kernel continously syncs back the pages to the underlying file as the VM is running and without stopping it
+  - If we want to explicitly flush pages to disk and wait for that to be done, we can do so by calling `msync`
+  - Now, all we need to do is to track changes to the file that Firecracker has `mmap`ed, and we can continously detect changes to the guest's memory as they are happening!
+- Silo
+  - In order to sync data from the old host to a new host when moving a VM between them, or in order to quickly start a VM from a remote image, we need to expose a virtual file to Firecracker that contains the memory snapshot, CPU registers, disk etc.
+  - When the kernel then asynchronously writes back changes to that file, that virtual file should be able to handle these changes and sync them over to the destination
+  - Since we can track both reads and writes, we can do a "hybrid" migration
+  - On the source, the VM starts synching chunks of memory over to the destination while the VM is running until the amount of changes/iteration becomes small enough to make it decide to stop time, switch over to the destination, and resume time over there
+  - The destination continues to receive the chunks that were marked as dirty/have changed by the source before time was stopped
+  - If a chunk is not available on the destination and the VM needs it immediately, it's requested from the source and prioritized to be sent over
+  - Locks are in place to make sure that nothing ever reads stale data
+  - Silo implements these virtual files through NBD devices
+  - It's open-source (AGPL-3.0) and also includes a high-performance NBD client and server implementation
+  - Has a NDB-independent internal storage engine that can support both P2P migrations, migrations with a 3rd-party data store as the data plane (e.g. S3), and hybrid approaches where the pre-migration step is done using S3, but the post-migration step is done P2P to migrate as fast as possible
+  - Includes both a CLI and an easy-to-use library
+  - Is independent of the transport layer; can run via TCP, TLS, UNIX pipes etc.
+  - Includes an efficient copy-on-write layer, integrity verification and helps de-duplicate data between multiple data sources (e.g.)
+- Drafter
+  - Drafter integrates Silo and Firecracker together
+  - It connects the Silo virtual file with the Firecracker/VM resources (memory, CPU registers, disk images, kernel)
+  - It also is what initiates connections between the source and destination and what integrates the Firecracker/VM lifecycle (`msync` & requesting which pages are dirty etc.) with Silo
+  - Makes starting VMs as easy as a library call in Go, with full recovery handling and context awareness
+  - Also includes a full-fledged, bi-directional VSock based agent system to inform the guest about events on the host, execute commands in it, or export metrics based on `panrpc`
+  - Includes all the components needed to build a VM-based software platform
+  - `drafter-nat` and `drafter-forwarder`, simple NAT and port-forwarding tools that allow forwarding ports from the VM much like Docker does
+  - `drafter-agent` and `drafter-liveness`, which allow for efficient VSock-based RPC calls between the guest and the host
+  - `drafter-snapshotter`, which enables creating a fresh snapshot from a VM image and allows configuring the CPU template, amount of allocated memory and CPUs etc.
+  - `drafter-packager`, which can take VM images ("blueprints") or VM snapshots ("packages) and create and extract a distributable package from them
+  - `drafter-runner`, which can start a VM package/snapshot (very useful for local testing or running VMs that will always stay on the same host)
+  - `drafter-registry`, which allows serving a VM package/snapshot over the network (useful for quickly starting a VM image from a remote)
+  - `drafter-mounter`, which allows sharing a resource (e.g. a disk, kernel or memory region) between two VMs
+  - `drafter-peer`, which allows streaming in a VM from the network or starting from a local snapshot, making that VM migratable, and then migrating the VM to another peer on a different host
+  - `drafter-terminator`, which allows migrating a VM to a host without starting it (to terminate a P2P migration chain)
+  - And again - thanks to PVM and the patches to Firecracker, all of this runs pretty everywhere - no nested virtualization or VMs required!
+- Demo of moving Valkey with Drafter (like in last KubeCon)
+  - Moving between EC2, GCP, Azure and Hetzner while clients get disconnected
+  - This is using the Valkey OCI image as the payload, which is started with `crun`
+  - Do demo
+- Demo of moving the k3s cluster with Drafter
+  - One of the benefits of using VMs is that we can run every application inside of them
+  - While running Kubernetes & it's CNI, CSI, CRI etc. plugins inside of a container is hard to impossible, it's normal, safe and expected to do so in a VM
+  - In our case, we've created a VM that runs Kubernetes, and we want to move that specific, universal VM image from EC2 to GCP to Azure and finally to Hetzner
+  - The entire Kubernetes cluster including all of it's services will get migrated, and it Just Works™
+  - This is a first since building a Kubernetes cluster with such heterogenous nodes is usually a problem - each cloud provider usually has a slightly different base OS and CPU features, but with VMs, Drafter and PVM the actually same image can be deployed to all of the cloud providers, completely eliminating the issues
+  - Do demo
+- Conduit for network live migration
+  - So far, the network connection was cut during each migration
+  - This is because the physical IP address of the Kubernetes cluster/it's nodes change each time the VM gets migrated
+  - Conduit is another Loophole product (proprietary) that allows us to migrate network connections between nodes
+  - It's extremely fast (can push 40GB/s), does not decrypt or intercept/proxy/modify your data (it's fully opaque)
+  - Works for both outbound and inbound connections (so both e.g. the database server your server is connected to, and the user that's connected to your server, stay connected)
+  - Doesn't require the original host to stay up during migrations - connections actually do migrate to the destination host, e.g. your ping gets lower after migrating
+- Architect for integrating Conduit, a control plane, API and dashboard, metrics, integrating with creating VMs on public cloud to then run PVM VMs on, listening for spot instance evictions & moving away in time, plus integrations with other services (starting VMs, GitHub actions and other CI/CD providers, migrating Kubernetes pods with a custom CRI)
+- Demo of moving Valkey with Architect (like in last KubeCon)
+  - Same VM image as before
+  - No change to the application at all
+  - By simply using Conduit, the migration happens between the different regions/data centers, without any interruption or downtime
+  - This means that we can use Spot instances for pretty much every application - including stateful ones, since they can just move off the VMs before they get destroyed!
+  - Do demo
+- Demo of moving the k3s cluster with Architect (with everything pointed at the Conduit ingress)
+  - Now we'll do the migration again - this time however, the connections even between the Kubernetes nodes will not be broken during a migration, and the service we've started will also keep on being online the entire time
+  - We can even use `kubectl` during the migration to start something new
+  - This allows building an entire Kubernetes cluster on spot instances - the kubelet can simply be evacutated before the instance gets deleted, without anyone noticing!
+  - Do demo
+- Demo of moving k8s pods with Architect
+  - So far, we've moved an entire Kubernetes cluster
+  - But that's complicated, and sometimes you really only want to move some pods between clusters
+  - We've built an entire Kata Containers-like system that transparently runs pods in any external Kubernetes distribution (EKS etc.) in virtual machines, and allows those pods and their network to be live-migrated
+  - There is no need for a CRD anymore - you simply create a deployment and specify where the pod should run and add an annotation
+  - When you want to migrate the VM to a different host, simply delete it and re-create it with the same annotation
+  - When the VM gets "re-created", it actually gets migrated in from the old source host automatically
+  - Like before - thanks to Conduit, there is no downtime, and this works across cloud providers!
+  - Do demo
+- Demo of CI/CD with Architect
+  - One of the best uses of spot instances is for running CI/CD or benchmarking
+  - A lot of CPU resources are required here usually, and that gets expensive
+  - Sometimes you even just want to run CI/CD on your own infrastructure, but that gets very complicated if you want true isolation/run each of your workloads in a fresh VM that's guaranteed to be compatible with GitHub's own setup
+  - Most providers that use public cloud instances schedule to images that are wildly different from the GitHub actions base image, meaning that it will not work by default, or they use Docker instead of VMs which breaks almost all Docker-based workflows
+  - With Architect, you can run CI/CD in public cloud, but still get the exact same image that powers GitHub actions
+  - It can also run on spot instances, which gives you an instant 90% discount (if you have a $1000/month CI/CD AWS bill, that bill will go down to $100/month) - and if the spot instance gets pre-empted, Architect instantly detects this and moves CI/CD off to a second host without anyone noticing and no downtime
+  - This is the first product we're officially making available today, you can head on over to `architect.run`, connect your GitHub & AWS accounts, replace `ubuntu-latest` with `architect-ubuntu-latest`, and you'll schedule workloads using PVM on spot instances!
+  - Do demo
+- Recap
+  - For you as a developer, operator or company, you want your complement (the cloud) to be a truly fungible, commoditized resource
+  - PVM allows running a familiar universal compute unit that behaves exactly the same way across all clouds (a VM) - even if the cloud provider doesn't allow nested virtualization and you're not using bare metal
+  - Silo allows migrating a lot of data between cloud providers very quickly and efficiently
+  - Drafter can take that new, universal compute unit based on Silo and Firecracker and migrate it between regions, cloud providers and even continents in a very easy way, even if it's as complex as an entire Kubernetes cluster
+  - Conduit can then also take all inbound and outbound network connections and move them between nodes, between regions and cloud providers, meaning that you can move a VM without any downtime happening along the process
+  - Architect allows integrating all of these systems together and integrates them with your existing external services, such as your Kubernetes distro of choice, your own in-house orchestrator, or your CI/CD provider, and connects them to your cloud provider and on-prem infrastructure so that it can automatically spin up VMs and migrate them if spot instances get pre-empted
+- OSS repo list
+- Speaker and company notes again
+- CTA (signing up for the CI/CD product)

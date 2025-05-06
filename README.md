@@ -1,4 +1,4 @@
-# Architect BugBash 2025 Demo
+# Architect Talks
 
 ## Overview
 
