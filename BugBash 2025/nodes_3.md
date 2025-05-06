@@ -1,0 +1,101 @@
+# Commoditize Your CI Compute: Spot Instances Without the Spotty Reliability
+
+- Intro
+  - Welcome everyone!
+  - Introduce myself (I'm Felicitas (or Fel for short) and I'm with Loophole Labs)
+  - We've heard lots of interesting talks already on finding bugs, fixing them or how to prevent them in the first place
+  - This talk is a bit more meta and about the actual underlying compute infrastructure that we use to run our CI/CD
+  - Title: "Commoditize Your CI Compute: Spot Instances Without the Spotty Reliability" (put a twist on it/rephrase it)
+  - This is a bit of a speedrun - prior talks on this topic were ~35 minutes, we have just 6 minutes to get through the entire stack and two minutes for a live demo today, so let's get started!
+- Show of hands
+  - "Who here is _not_ running their CI/CD on spot instances/ephemeral compute?"
+  - Observe responses: "That's what I thought - and I don't blame you, that makes total sense!"
+- Why everybody should be using spot instances/ephemeral compute for their CI/CD workloads
+  - 70-90% cost savings compared to on-demand
+  - Buy and release immediately, only use them for as long as you want
+  - Even from a cloud provider's perspective it's more efficient because they can reclaim the instances when they need them back without waiting, otherwise the capacity would be wasted
+- Why nobody is using them right now
+  - The Reclamation Risk
+    - 30-120s termination notices
+    - Host and all of it's data gets deleted
+    - Catastrophic for stateful workloads (builds, GPU training, integration tests)
+  - The Complexity Tax
+    - Current solutions:
+      - 1. Don't use spot and overpay for on-demand
+      - 2. Limit to stateless jobs (which can only ever be so useful)
+      - 3. Build complex, custom checkpointing for each individual application
+      - 4. Accept failures/retries and make everything idempotent
+  - The Hidden Costs
+    - Hundreds of thousands of dollars of annual waste for mid-sized teams because on-demand instances are being used
+    - Constrained innovation:
+      - Developers need to run fewer tests, not run on every commit
+      - Shorter or no benchmarks can be run
+      - Shorter fuzzing sessions than you would like
+      - Simplified integration test scenarios because there isn't enough compute time avilable
+  - The Lock-In Trap
+    - It's not just about cost - it's also about digital sovereignty
+    - Cloud providers follow the "Law of Complements" (they monopolize compute while commoditizing the layers below them, e.g. the OS (Linux) or hardware (Open Compute Project)) themselves since they control the infrastructure, but you can't and are always in a disadvantageous negotiation position
+    - Proprietary compute ecosystems (EC2 etc.) prevent you from switching between and expanding across clouds
+    - No true workload portability because there is no way to define a real virtual machine (with full snapshot etc. support) in such a way that it runs on EC2, GCP, Azure etc. - each provider has their own, closed standards and ecosystems
+- How Architect allows you to use spot instances for all workloads
+  - Core proposition:
+    - "Unified failure-proof compute fabric" based on any number of any type of virtual machine from any cloud
+  - Three key capabilities:
+    - 1. Cloud-agnostic VM images and snapshots (for arbitrage between clouds there needs to be a new type of VM that runs everywhere, no more AMIs) - we're not replacing VMs with containers or another non-equivalent, it's actual, real, well-known KVM-based VMs
+    - 2. Quick live migration/evacuation to a new host (faster than the 30s-120s termination notice) - that allows you to use spot instances just like if they were regular on-demand instances
+    - 3. Zero code changes (should just work - support for the entire compute stack (CPU/GPU/disk/network) even with migrations)
+- How Architect works
+  - Tech stack:
+    - PVM (Pagetable Virtual Machines):
+      - Is a Linux patchset that was first sent out in 2024 by Ant Group and Alibaba
+      - Allows fully accelerated KVM-based virtual machines on top of VMs (so they don't require expensive metal instances - like with nested virtualization), except without the need for software emulation (e.g. QEMU) or hardware support (VT-d/AMD-V or nested virtualization) - practically no overhead (<10%, far below the cost savings)
+      - Custom Loophole patches allow cross-cloud VM portability and live migration support (which upstream doesn't) and include a rewrite of the MMU to speed up forking in the guest VM (which is the main performance impact of PVM otherwise)
+    - Drafter (Compute Migration):
+      - Is OSS (AGPL-3.0)
+      - Is the unit of compute in the stack
+      - Exposes Firecracker via an easy to use Go library
+      - Normalizes CPUs across hosts with CPU templates, so that you can safely migrate between heterogenous hosts
+      - Uses a customized Firecracker fork with support for continous tracking of memory changes as the VM is running for live migration
+      - Allows easy communication with the guest using a VSock-based RPC interface
+    - Silo (Data Migration):
+      - Is OSS (AGPL-3.0)
+      - Migrates the actual data between the hosts, regardless of whether that's memory or disk data
+      - Continously tracks any changes that the guest makes and learns about usage patterns
+      - Creates continuous backups of all VM resources and syncs them to S3 asynchronously as the VM is running
+      - When it comes time to migrate from source to destination, it can use the usage patterns it learned about to sync the chunks that are most needed at the destination first to prioritize those chunks over the P2P connection
+    - Conduit (Network Migration):
+      - Usually, when migrating from A to B the IP address changes and connections break
+      - Conduit fixes this issue by migrating the connections themselves from source to destination
+      - True network migrations - after resuming on the destination, the source can be shut down and traffic doesn't need to be routed through the source host anymore. If you live migrate to a host that's closer to you, you will see the ping drop.
+      - Written in eBPF, so works for any L3 protocols (UDP & TCP) and runs on the network card itself which makes it speedy
+      - No changes needed to applications or protocols, runs even with proprietary payloads like Minecraft servers
+      - Ingress and egress migrations are both supported, so if you have a CI/CD job running in the guest that's downloading something and you're migrating away from the source host, that download will not be interrupted during the migration and just continue running on the destination as though nothig happened
+      - Out of scope for this talk, but I'll link video recordings of talks of us migrating a Minecraft and Valkey server between continents as the audience at KubeCon is connected to them, and the connections don't break during the migration later
+    - Mirage (GPU Migration):
+      - Can migrate GPU workloads from the source to the destination
+      - No change to applications necessary, works with inference (e.g. unchanged Ollama) and training out of the box
+      - Even if the LLM is in the middle of answering a request, it will just continue after the migration from exactly where it left off, the user will see no interruption at all (since there wasn't one)
+      - Works across hosts, clouds and different GPU types, just like Drafter can do for different CPUs
+      - Doesn't need to integrate with expensive snapshot/restore logic, is a live migration just like for VMs etc. and works on spot instances
+      - Out of scope for this talk and still in closed beta, but if you're interested in this talk to me afterwards or reach out to me
+    - Architect itself ("Migration Policy Engine"):
+      - Connects all of the components together and exposes them through a simple API
+      - Is a kind of "conductor" in an orchestra of the individual components and makes sure that compute, disk, GPU etc. migrations all work as one coherent unit/transaction
+      - Integrates the components with external interfaces, e.g. GitHub actions, Kubernetes, CRI-compatible interfaces, REST APIs etc.
+      - Can talk to the cloud provider (EC2, GCP, Azure etc.) and create cloud instances, S3 buckets etc. for you when Kubernetes requests an additional node or GitHub schedules a job for you
+      - Can be proactive in making decisions
+        - Migrate off an instance if it gets a spot preemption notice or a host needs to go down for maintainenance, spins up replacement hosts etc. for you
+        - Can look at costs of all of the different cloud providers in a single plane and if there is a cheaper one, automatically move to it without downtime
+        - Makes sure that your system is always available in different clouds and availability zones by automatically spinning up replicas/redundancy
+        - Can move a system closer to your users if usage patterns change (e.g. based on time zones)
+- Show that Architect works with it (demo)
+  - Migrate TigerBeetle fuzzing tests between AWS/GCP/Azure while the fuzzer continues running
+  - This would usually run using Architect's GitHub action integration, but since we're super tight on time I'll run it manually for you so that we can speed up the process
+  - OCI image we're running today is public, so you can verify exactly what's happening and that this isn't just smoke and mirrors
+- How you can use Architect now (waitlist)
+  - Call to action:
+    - Public beta launching soon, and I'd like to invite you to our wait list for it (visit architect.io)
+    - First integration: GitHub Actions runner powered by Architect that runs in your cloud account on spot instances and, if it gets a preemption notice, automatically spins up a replacement instance & migrates to it completely transparently and automatically, for end-users it works like any other GitHub Action runner
+    - Also in the works is a Kubernetes integration (see talks linked at the end for more information on that) and more CI/CD providers
+    - If you want to talk more about Architect, I'm available all day today so just come up to me and I'd be happy to discuss more technical aspects and integration steps we could do!
+  - Closing vision: "The future of CI/CD isn't about choosing between cost and reliability - it's about having both, on your terms, across any type of infrastructure."

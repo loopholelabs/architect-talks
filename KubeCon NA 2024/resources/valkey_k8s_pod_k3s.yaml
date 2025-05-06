@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: valkey-pod
+  namespace: default
+spec:
+  nodeName: architect-k3s-agent-54509ac3
+  containers:
+    - name: valkey-container
+      image: valkey/valkey:latest
+      imagePullPolicy: Always
+      resources: {}
+      volumeMounts: []
+      ports:
+        - containerPort: 6379
+          protocol: TCP
+          hostPort: 6379
