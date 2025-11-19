@@ -99,7 +99,7 @@ As an example, we'll demo how Architect implements checkpoint/restore for Kubern
   - gVisor
     - Unlike containers, gVisor provides "real" sandboxing support
     - Virtualizes syscalls, filesystems and networking for much better security than containers
-    - How it works
+    - How it starts processes
       1. Reads the OCI runtime spec (`config.json`) just like any other OCI runtime would
       1. Creates a new process for the sandbox and puts it into a network namespace, configures resources with cgroups
       1. Starts gofer process (a filesystem process) with very limited capabilities (no `CAP_SYS_ADMIN` etc.), which limits FS access (if Sentry is compromised, the gofer still limits how much the attacker can access)
@@ -134,19 +134,56 @@ As an example, we'll demo how Architect implements checkpoint/restore for Kubern
       - Sentry has internal structs for kernel resources, which are much easier to serialize than kernel state
       - The network suspend/restore implementation is more complete since it doesn't rely on the kernel TCP implementation
     - Restore
-      - Sandbox process, Sentry and gofer get started just like with the initial start, with minimal state
-      - Checkpoint image files get read into memory, where the state decode then parses the format and unmarshals into the relevant serializable gVisor components
-      - Kernel state gets restored by iterating through tasks and creating goroutines for each, using the same internal PID as on checkpoint
-      - CPU registers, signal handlers, credentials and FS context get set back in the gVisor resources
-      - Memory managers get recreated in the same virtual address ranges as the checkpoint with the same flags, and memory pages get read from the checkpoint files
-      - mmap-ed regions backed by an actual file get re-mapped to the same path on the host
-      - The filesystem state gets reconstructed from the checkpoint and the gofer filesystems get reconnected, tmpfs files get restored from checkpoint, `/proc` and `/sys` get re-generated from the now restored gVisor state
-      - File descriptor tables get restored for each task, by gofer re-opening them on the host or reading them from the checkpoint data for tmpfs
-      - Network state gets restored by creating a new netstack instance and creating NICs and routing tables with the stored data from the checkpoint
-      - TCP sockets, UNIX sockets etc. get restored in netstack
-      - Devices (PTY etc.) get restored by recreating them based on the checkpoint data
-      - To resume, the kernel clears the restore flag (similar to the stop flag), which then iterates through each task, sets registers with the instruction pointer, and jumps to the instruction pointer (depending on the platform, by executing and monitoring it with seccomp for systap, and in KVM by making the guest CPU do that) to restore the task exactly where it left off
+      1. Sandbox process, Sentry and gofer get started just like with the initial start, with minimal state
+      1. Checkpoint image files get read into memory, where the state decode then parses the format and unmarshals into the relevant serializable gVisor components
+      1. Kernel state gets restored by iterating through tasks and creating goroutines for each, using the same internal PID as on checkpoint
+      1. CPU registers, signal handlers, credentials and FS context get set back in the gVisor resources
+      1. Memory managers get recreated in the same virtual address ranges as the checkpoint with the same flags, and memory pages get read from the checkpoint files
+      1. mmap-ed regions backed by an actual file get re-mapped to the same path on the host
+      1. The filesystem state gets reconstructed from the checkpoint and the gofer filesystems get reconnected, tmpfs files get restored from checkpoint, `/proc` and `/sys` get re-generated from the now restored gVisor state
+      1. File descriptor tables get restored for each task, by gofer re-opening them on the host or reading them from the checkpoint data for tmpfs
+      1. Network state gets restored by creating a new netstack instance and creating NICs and routing tables with the stored data from the checkpoint
+      1. TCP sockets, UNIX sockets etc. get restored in netstack
+      1. Devices (PTY etc.) get restored by recreating them based on the checkpoint data
+      1. To resume, the kernel clears the restore flag (similar to the stop flag), which then iterates through each task, sets registers with the instruction pointer, and jumps to the instruction pointer (depending on the platform, by executing and monitoring it with seccomp for systap, and in KVM by making the guest CPU do that) to restore the task exactly where it left off
   - Firecracker
+    - Starts lightweight VMs, not processes ("microVM")
+    - Full KVM-based isolation for great security properties
+    - Comes with some overhead as a result of this since you'll be running a nested kernel, but that kernel is very minimal and uses next to no resources - you can run thousands of such VMs on a single node
+    - CPUIDs can be set with CPU templates so that multiple different hosts can be reduced to their lowest common denominator
+    - Needs some sort of hardware acceleration, so it only works with bare metal (unless PVM is used)
+    - How it starts a microVM
+      1. Receives a REST API call that configures the internal VM configuration
+      1. Opens `/dev/kvm` and creates a VM file descriptor via `KVM_CREATE_VM`
+      1. Allocates guest memory via mmap and registers the new memory regions via the KVM devices
+      1. Creates vCPUs for each CPU via the KVM devices
+      1. Loads the Linux kernel into guest memory
+      1. Initializes virtio devices (disks/block devices, net, entropy etc.) and registers them on the VM bus
+      1. Configures the system for boot (setting up ACPI (x86)/Device Tree (aarch)) and spawns a (paused) thread for each vCPU
+      1. Applies seccomp filters to the VMMs and vCPU threads for better sandboxing (similar to how the Sentry is sandboxed in gVisor), then unpauses the vCPU threads and KVM begins executing the guest kernel
+    - How a microVM accesses host resources
+      - Code runs on the physical CPU (sandboxed via VT-d/VT-x)
+      - (Block) device I/O happens via virtio devices, which then gets handled on the host via interrupts
+      - For networking, TAP devices are usually used on the host, which can then be put into network namespaces etc. for sandboxing
+    - Checkpoint
+      1. Receives a REST API call that pauses all vCPUs, which causes all vCPU threads to exit from `KVM_RUN`
+      1. Sends a `SaveState` event to each vCPU thread, which dumps CPU state (e.g. registers, MSRs, LAPIC state, TSC frequency, CPUID leaves etc.)
+      1. Dumps VM-level states (guest memory etc.) and virtio device state from the host (serializes queues and configuration, e.g. MAC address or TAP device names)
+      1. Serializes device state into a snapshot file and guest memory into a separate file
+      1. After checkpointing, VM is either left running (by resuming the vCPU threads) or stopped completely
+    - Checkpointing here is different from both CRIU and gVisor
+      - Firecracker controls the entire guest CPU and devices, so it can checkpoint a much simpler and well-defined interface
+      - No need for TCP restore per se since the whole network device is checkpointed
+      - No need for file descriptors to be dumped or syscalls to be paused/resumed in the guest, all of that state is just stored in the guest memory
+      - No need for a virtual file system like with gVisor since the well-defined virtio devices exist
+      - Memory can be lazy-loaded since it is just an `mmap`ed region and doesn't have to be read by the kernel
+    - Restore
+      1. Receives REST API call that opens the snapshot state file and deserializes it
+      1. Loads guest memory with `mmap` (so that it can be lazy-loaded), either from a file (for non-anonymous memory) or initialized with zeros
+      1. Reads vCPU counts, memory sizes, CPU templates etc. and configures KVM like at startup, just using the values from the checkpoint files
+      1. Restores vCPUs by setting TSC frequencies and registers for each vCPU from the checkpoint
+      1. Restores the Firecracker implementations of the virtio devices from the checkpoints by deserializing them, (re-)opening the TAP devices, setting the MAC addresses and recreates the queues
+      1. Like with the original startup process, it applies seccomp filters to the VMMs and vCPU threads for better sandboxing (similar to how the Sentry is sandboxed in gVisor), then unpauses the vCPU threads and KVM begins executing the guest kernel
   - PVM
   - Network migration via XDP
 - Demo of C/R on Kubernetes with Architect
