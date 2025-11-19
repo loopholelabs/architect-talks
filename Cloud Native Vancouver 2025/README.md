@@ -185,6 +185,21 @@ As an example, we'll demo how Architect implements checkpoint/restore for Kubern
       1. Restores the Firecracker implementations of the virtio devices from the checkpoints by deserializing them, (re-)opening the TAP devices, setting the MAC addresses and recreates the queues
       1. Like with the original startup process, it applies seccomp filters to the VMMs and vCPU threads for better sandboxing (similar to how the Sentry is sandboxed in gVisor), then unpauses the vCPU threads and KVM begins executing the guest kernel
   - PVM
+    - Usually, you need to have hardware virtualization support in order for you to start VMs (AMD/Intel's VT-d/VT-x)
+    - You can use emulation, but that makes things very slow/high-latency
+    - Nested virtualization also exists, but there are very heavy performance penalties with that approach and some security concerns (almost no cloud provider enables it)
+    - PVM fixes this, it implements a KVM vendor implementation (like VT-d) that works similarly to how we sandbox processes in user space with a new method called shadow paging
+    - How PVM works
+      - Code execution of the guest kernel happens in Ring 3 (just like a regular process), the guest kernel vs. host kernel distinction is done via software flags and shadown page tables
+      - Syscalls from guest userspace to the guest kernel trap to the in-kernel switcher component, which switches CR3 (page table pointer, from guest user to guest kernel page tables) and GSBASE (per-CPU/thread-local data pointer), then returns directly to the guest kernel's syscall handler via SYSRETQ without hypervisor involvement
+      - Hypercalls from the guest kernel use the SYSCALL instruction (in supervisor mode), which traps to the hypervisor and are handled as either PVM-specific hypercalls (page table switching, TLB flushes, MSR access) or standard KVM hypercalls
+      - For memory access, PVM maintains a shadow page table which contains the physical addresses of where things are on the host, changes to the guest page table get intercepted and make PVM update the shadow tables
+      - Exceptions/interrupts trap to the hypervisor, which either handles them for shadow MMU/emulation (page fault etc.) or injects them back to the guest via its event delivery mechanism
+    - It is very performant in CPU-heavy workloads, but has some impacts on performance in fork-heavy workloads (think Linux kernel compliations where `make` calls fork a lot of times)
+    - Not a mainline patch yet, but a patchset for Linux 6.12 (LTS) is available
+    - We maintain a few Firecracker patches that support C/R with Firecracker and PVM: https://github.com/loopholelabs/firecracker/tree/main-live-migration-pvm
+    - Sources: https://github.com/virt-pvm/linux, https://github.com/virt-pvm/misc
+    - It implements a lot of the KVM vendor implementation interface, enough for the Firecracker C/R implementation to basically just work™!
   - Network migration via XDP
 - Demo of C/R on Kubernetes with Architect
   - Signing up via the console
