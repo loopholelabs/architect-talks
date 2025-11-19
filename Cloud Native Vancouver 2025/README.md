@@ -12,7 +12,7 @@ C/R also enables scaling idle apps to zero so they release their resources. Clus
 
 It also can be used to do live migrations, where stateful apps can be moved between nodes without downtime. This makes a lot of things much easier: App state isn't lost when nodes are drained, they can be live migrated off a node before maintenance is done, and binpacking becomes much easier since moving an app to a node with available space can be done without losing app state.
 
-A few technologies allow for C/R on Linux. CRIU is the most popular one; it serializes kernel resources into protocol buffers and restores them by transmuting a virtual process back into the original, which integrates well with OCI runtimes. gVisor virtualizes syscalls like a microkernel, providing more control but with a performance penalty since syscalls run in userspace. Firecracker provides VM snapshot/restore with high reliability but requires KVM, limiting it to bare-metal. PVM may eventually support non-bare-metal environments.
+A few technologies allow for C/R on Linux. CRIU is the most popular one; it serializes kernel resources into protocol buffers and restores them by transmuting a virtual process back into the original, which integrates well with OCI runtimes. gVisor virtualizes syscalls like a microkernel, providing more control but with a performance penalty since syscalls run in userspace. Firecracker provides VM snapshot/restore with high reliability but requires KVM, limiting it to bare-metal. PVM may eventually support non-bare-metal/non-nested virtualization environments.
 
 As an example, we'll demo how Architect implements checkpoint/restore for Kubernetes using this tech. Runtime classes allow you to opt in to using checkpoint/restore, while annotations and labels control scaling and migration behavior. Scale to zero is triggered by listening for network traffic via XDP and the existing CNI, and migrations are triggered by a pod being deleted and re-created with the same pod template hash. Karpenter and cluster autoscalers can then right-size the cluster automatically. We'll demo some examples like a Go service, Valkey/Redis, Postgres, and Minecraft servers being migrated during the talk.
 
@@ -203,7 +203,8 @@ As an example, we'll demo how Architect implements checkpoint/restore for Kubern
   - Network migration via XDP
     - Usually, during a network migration, connections break
     - We use XDP on both ingress and egress to intercept traffic
-    - Us using XDP for this means that the actual eBPF code runs on the network card, not on the CPU, which makes this very fast
+    - We use XDP in driver mode, which means the eBPF programs run inside the network interface driver in the kernel on the host machine CPU (not on the NIC itself - that would be offload mode, which only works on an extremely small subset of cards with XDP-supporting DPUs)
+    - The efficiency gains come from skipping the normal kernel network stack steps, allowing us to intercept packets very early in the processing pipeline
     - In our testing we were able to get up to 200 Gb/s: https://loopholelabs.io/blog/xdp-for-egress-traffic
     - Once we're in the data path, we can intercept traffic, buffer it, redirect it etc. which allows us to pause traffic before a checkpoint, do the checkpoint, resume on a different (in the case of a migration) or the same (in the case of a scale to zero operation) node, and unpausing traffic while flushing buffers, effectively migrating a connection without causing any downtime
     - Even if we're moving between nodes we can migrate the connections as long as we're in the data path somewhere between the user and the server, which thanks to eBPF & XDP is quite scalable
