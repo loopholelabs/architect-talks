@@ -201,6 +201,13 @@ As an example, we'll demo how Architect implements checkpoint/restore for Kubern
     - Sources: https://github.com/virt-pvm/linux, https://github.com/virt-pvm/misc
     - It implements a lot of the KVM vendor implementation interface, enough for the Firecracker C/R implementation to basically just work™!
   - Network migration via XDP
+    - Usually, during a network migration, connections break
+    - We use XDP on both ingress and egress to intercept traffic
+    - Us using XDP for this means that the actual eBPF code runs on the network card, not on the CPU, which makes this very fast
+    - In our testing we were able to get up to 200 Gb/s: https://loopholelabs.io/blog/xdp-for-egress-traffic
+    - Once we're in the data path, we can intercept traffic, buffer it, redirect it etc. which allows us to pause traffic before a checkpoint, do the checkpoint, resume on a different (in the case of a migration) or the same (in the case of a scale to zero operation) node, and unpausing traffic while flushing buffers, effectively migrating a connection without causing any downtime
+    - Even if we're moving between nodes we can migrate the connections as long as we're in the data path somewhere between the user and the server, which thanks to eBPF & XDP is quite scalable
+    - No opt-in is required from applications - anything, whether it's TCP or UDP, can be migrated this way
 - Demo of C/R on Kubernetes with Architect
   - Signing up via the console
   - Installing it via Helm
