@@ -206,7 +206,13 @@ As an example, we'll demo how Architect implements checkpoint/restore for Kubern
     - We use XDP in driver mode, which means the eBPF programs run inside the network interface driver in the kernel on the host machine CPU (not on the NIC itself - that would be offload mode, which only works on an extremely small subset of cards with XDP-supporting DPUs)
     - The efficiency gains come from skipping the normal kernel network stack steps, allowing us to intercept packets very early in the processing pipeline
     - In our testing we were able to get up to 200 Gb/s: https://loopholelabs.io/blog/xdp-for-egress-traffic
-    - Once we're in the data path, we can intercept traffic, buffer it, redirect it etc. which allows us to pause traffic before a checkpoint, do the checkpoint, resume on a different (in the case of a migration) or the same (in the case of a scale to zero operation) node, and unpausing traffic while flushing buffers, effectively migrating a connection without causing any downtime
+    - Once we're in the data path:
+      1. We can intercept traffic
+      1. Buffer it
+      1. Redirect it etc. which allows us to pause traffic before a checkpoint
+      1. Do the checkpoint
+      1. Resume on a different (in the case of a migration) or the same (in the case of a scale to zero operation) node,
+      1. Unpausing traffic while flushing buffers, effectively migrating a connection without causing any downtime
     - Even if we're moving between nodes we can migrate the connections as long as we're in the data path somewhere between the user and the server, which thanks to eBPF & XDP is quite scalable
     - No opt-in is required from applications - anything, whether it's TCP or UDP, can be migrated this way
 - Demo of C/R on Kubernetes with Architect
